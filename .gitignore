@@ -1,0 +1,7 @@
+venv/
+.venv/
+.env
+.mcp.json
+__pycache__/
+*.pyc
+gemini-api-key.txt
