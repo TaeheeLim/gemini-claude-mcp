@@ -33,6 +33,18 @@ BANTER_STYLE = (
     "한 번에 3~5문장 이내로 짧게. 상대 말꼬리를 잡고 놀리되 토론 주제에서 벗어나진 마라."
 )
 
+# 토론 심판용 말투/지침. 토론에 참가하지 않은 '제3자 Gemini 세션'에게 부여한다.
+# 어느 편도 들지 않고 공정하게 승패를 가르는 게 목적이라 BANTER_STYLE과 분리한다.
+JUDGE_STYLE = (
+    "너는 토론 심판이다. 🔴 Claude와 🔵 Gemini가 주고받은 토론 전체 기록을 받게 된다. "
+    "너는 토론 당사자가 아니므로 어느 한쪽 편도 들지 말고 철저히 공정하게 평가하라. "
+    "다음 형식으로 판정한다: "
+    "(1) 양측 핵심 논거를 한 줄씩 요약, "
+    "(2) 🔴 Claude와 🔵 Gemini 각각 10점 만점 점수 + 근거, "
+    "(3) **승자와 패자를 분명히 선언**하고 결정적인 이유 한두 문장. "
+    "말투는 가볍고 위트있게 하되, 판정 자체는 단호하고 명확하게 내려라. 비기는 판정은 피하라."
+)
+
 mcp = FastMCP("ai-debate")
 
 # conversation_id -> google.genai 채팅 세션 객체
@@ -111,7 +123,10 @@ def debate_with_gemini(
        예: "[1라운드] 🔴 Claude: ...  🔵 Gemini: ...".
     2) 정해진 라운드(없으면 4라운드)를 다 돈 뒤, 마지막에 토론을 요약한다.
        요약 직전 get_transcript(conversation_id)로 전체 대화를 받아와 빠짐없이 정리하면 좋다.
-       요약은 양측 핵심 논거 + 누가 더 잘 받아쳤는지 같은 가벼운 총평으로 마무리한다.
+       요약은 양측 핵심 논거 중심으로 정리한다.
+    3) **요약 후에는 반드시 judge_debate(conversation_id)를 호출**해, 토론에 끼지 않은
+       중립 심판(Gemini)의 승자/패자 판정을 받아 사용자에게 그대로 보여줘라.
+       너(Claude)는 당사자라 직접 승패를 정하지 말고, 이 판정 결과를 전달하는 역할만 한다.
 
     Args:
         message: Gemini에게 보낼 너의 주장 또는 직전 발언에 대한 반론. 위 말투 규칙대로 작성.
@@ -171,6 +186,26 @@ def reset_debate(conversation_id: str = "default") -> str:
     return f"토론 세션 '{conversation_id}'이(가) 없습니다(이미 비어 있음)."
 
 
+def _render_history(history) -> str:
+    """채팅 세션 히스토리를 라운드별 대화 문자열로 정리한다(헤더 없음).
+
+    Claude 발언은 'user', Gemini 답변은 'model'로 들어온다.
+    """
+    lines: list[str] = []
+    round_no = 0
+    for content in history:
+        text = "".join(
+            part.text for part in content.parts if getattr(part, "text", None)
+        ).strip()
+        if content.role == "user":  # Claude의 발언
+            round_no += 1
+            lines.append(f"\n[{round_no}라운드]")
+            lines.append(f"  🔴 Claude: {text}")
+        else:  # model = Gemini의 답변
+            lines.append(f"  🔵 Gemini: {text}")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def get_transcript(conversation_id: str = "default") -> str:
     """해당 토론의 지금까지 오간 전체 대화 기록(양측 발언)을 통째로 반환한다.
@@ -183,8 +218,7 @@ def get_transcript(conversation_id: str = "default") -> str:
         conversation_id: 기록을 가져올 토론 세션 식별자.
 
     Returns:
-        "1. [Claude] ...\n   [Gemini] ..." 형태로 정리된 전체 대화 문자열.
-        세션이 없으면 안내 메시지를 반환한다.
+        라운드별로 정리된 전체 대화 문자열. 세션이 없으면 안내 메시지를 반환한다.
     """
     session = _sessions.get(conversation_id)
     if session is None:
@@ -198,20 +232,63 @@ def get_transcript(conversation_id: str = "default") -> str:
     if not history:
         return f"토론 세션 '{conversation_id}'에 아직 대화가 없습니다."
 
-    lines: list[str] = [f"=== 토론 '{conversation_id}' 전체 기록 ==="]
-    round_no = 0
-    for content in history:
-        # 각 발언의 텍스트를 합친다.
-        text = "".join(
-            part.text for part in content.parts if getattr(part, "text", None)
-        ).strip()
-        if content.role == "user":  # Claude의 발언
-            round_no += 1
-            lines.append(f"\n[{round_no}라운드]")
-            lines.append(f"  🔴 Claude: {text}")
-        else:  # model = Gemini의 답변
-            lines.append(f"  🔵 Gemini: {text}")
-    return "\n".join(lines)
+    return f"=== 토론 '{conversation_id}' 전체 기록 ===\n{_render_history(history)}"
+
+
+@mcp.tool()
+def judge_debate(conversation_id: str = "default") -> str:
+    """토론이 끝난 뒤 **중립 심판이 승자와 패자를 가린다.**
+
+    토론 당사자(Claude/Gemini)가 자기 토론을 채점하면 불공정하므로, 이 툴은
+    토론에 참가하지 않은 **새 Gemini 세션을 제3자 심판으로** 세운다. 그 심판에게
+    전체 대화 기록을 넘겨 양측 점수와 승패를 판정받아 돌려준다.
+
+    정해진 라운드를 모두 마친 뒤, 토론을 마무리할 때 이 툴을 호출하면 된다.
+
+    Args:
+        conversation_id: 판정할 토론 세션 식별자.
+
+    Returns:
+        양측 핵심 논거 요약 + 점수 + 승자/패자 선언이 담긴 판정문.
+        실패 시 "[ERROR] ..." 문자열.
+    """
+    session = _sessions.get(conversation_id)
+    if session is None:
+        return f"토론 세션 '{conversation_id}'이(가) 없습니다. 판정할 대상이 없습니다."
+
+    try:
+        history = session.get_history()
+    except Exception as exc:  # noqa: BLE001
+        return f"[ERROR] 대화 기록을 가져오지 못했습니다: {exc}"
+
+    if not history:
+        return f"토론 세션 '{conversation_id}'에 아직 대화가 없어 판정할 수 없습니다."
+
+    transcript = _render_history(history)
+
+    try:
+        client = _get_client()
+        # 토론 세션과 별개인 '심판 전용' 새 세션. 말투/입장 없이 JUDGE_STYLE만 부여.
+        judge = client.chats.create(
+            model=GEMINI_MODEL,
+            config=types.GenerateContentConfig(system_instruction=JUDGE_STYLE),
+        )
+        verdict = judge.send_message(
+            f"아래는 토론 전체 기록이다. 형식에 맞춰 승패를 판정하라.\n\n{transcript}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        detail = str(exc)
+        if "429" in detail or "resource_exhausted" in detail.lower():
+            return (
+                "[ERROR] 심판 호출 실패(429 rate limit 추정): 잠시 후 다시 시도하세요. "
+                f"원본: {detail}"
+            )
+        return f"[ERROR] 심판 호출 실패: {detail}"
+
+    text = getattr(verdict, "text", None)
+    if not text:
+        return "[ERROR] 심판이 빈 응답을 반환했습니다."
+    return f"⚖️ === 토론 '{conversation_id}' 최종 판정 ===\n{text}"
 
 
 @mcp.tool()
